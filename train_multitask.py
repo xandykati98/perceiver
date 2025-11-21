@@ -298,27 +298,41 @@ def calculate_gradient_statistics(model: nn.Module) -> Dict[str, float]:
 
 
 def train_model(model: nn.Module, train_loaders: Dict[str, DataLoader], test_loaders: Dict[str, DataLoader], 
-                criterion: nn.Module, optimizer: optim.Optimizer, device: torch.device, num_epochs: int) -> None:
-    """Train the model on multiple tasks and log metrics to MLflow."""
+                criterion: nn.Module, optimizer: optim.Optimizer, device: torch.device, num_epochs: int, 
+                samples_per_epoch: int = 1000) -> None:
+    """Train the model on multiple tasks with random task selection per sample."""
     model.train()
     
     tasks = ['cifar100', 'mnist', 'cifar10']
     total_step = 0
     best_accuracies: Dict[str, float] = {task: 0.0 for task in tasks}
+    
+    # Create iterators for each task
+    train_iters: Dict[str, any] = {}
+    for task in tasks:
+        train_iters[task] = iter(train_loaders[task])
 
     for epoch in range(num_epochs):
-        # Round-robin task selection
-        current_task = tasks[epoch % len(tasks)]
-        train_loader = train_loaders[current_task]
-        test_loader = test_loaders[current_task]
-        
-        print(f"\nEpoch [{epoch+1}/{num_epochs}] - Starting Task: {current_task}")
+        print(f"\nEpoch [{epoch+1}/{num_epochs}] - Random task sampling")
 
-        running_loss = 0.0
-        correct = 0
-        total = 0
+        running_loss: Dict[str, float] = {task: 0.0 for task in tasks}
+        correct: Dict[str, int] = {task: 0 for task in tasks}
+        total: Dict[str, int] = {task: 0 for task in tasks}
+        sample_counts: Dict[str, int] = {task: 0 for task in tasks}
 
-        for batch_idx, (data, target) in enumerate(train_loader):
+        for sample_idx in range(samples_per_epoch):
+            # Randomly select a task for this sample
+            current_task = random.choice(tasks)
+            sample_counts[current_task] += 1
+            
+            # Get next batch from the selected task
+            try:
+                data, target = next(train_iters[current_task])
+            except StopIteration:
+                # Restart iterator if exhausted
+                train_iters[current_task] = iter(train_loaders[current_task])
+                data, target = next(train_iters[current_task])
+            
             data, target = data.to(device), target.to(device)
 
             optimizer.zero_grad()
@@ -329,62 +343,72 @@ def train_model(model: nn.Module, train_loaders: Dict[str, DataLoader], test_loa
             loss = criterion(output, target)
             loss.backward()
 
-            if batch_idx % 100 == 0:
+            if sample_idx % 100 == 0:
                 grad_stats = calculate_gradient_statistics(model)
 
             optimizer.step()
 
-            running_loss += loss.item()
+            running_loss[current_task] += loss.item()
             _, predicted = torch.max(output.data, 1)
-            total += target.size(0)
-            correct += (predicted == target).sum().item()
+            total[current_task] += target.size(0)
+            correct[current_task] += (predicted == target).sum().item()
             total_step += 1
             
-            if batch_idx % 100 == 0:
+            if sample_idx % 100 == 0:
                 mlflow.log_metric(f"{current_task}_batch_train_loss", loss.item(), step=total_step)
 
-                model_stats = calculate_model_statistics(model)
-                for stat_name, stat_value in model_stats.items():
-                    mlflow.log_metric(f"model_stats/{stat_name}", stat_value, step=total_step)
+                if sample_idx % 100 == 0:
+                    model_stats = calculate_model_statistics(model)
+                    for stat_name, stat_value in model_stats.items():
+                        mlflow.log_metric(f"model_stats/{stat_name}", stat_value, step=total_step)
 
-                for stat_name, stat_value in grad_stats.items():
-                    mlflow.log_metric(f"gradients/{stat_name}", stat_value, step=total_step)
+                    for stat_name, stat_value in grad_stats.items():
+                        mlflow.log_metric(f"gradients/{stat_name}", stat_value, step=total_step)
 
-                print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}, Accuracy: {100 * correct / total:.2f}%')
+                task_acc = 100 * correct[current_task] / total[current_task] if total[current_task] > 0 else 0
+                print(f'Epoch [{epoch+1}/{num_epochs}] Sample [{sample_idx+1}/{samples_per_epoch}] ({current_task}), Loss: {loss.item():.4f}, Task Accuracy: {task_acc:.2f}%')
 
-            # Evaluate test accuracy every 200 batches
-            if batch_idx % 200 == 0:
-                test_accuracy = evaluate_model(model, test_loader, device)
-                mlflow.log_metric(f"{current_task}_test_accuracy_batch", test_accuracy, step=total_step)
-                print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Batch [{batch_idx+1}/{len(train_loader)}], Test Accuracy: {test_accuracy:.2f}%')
-                model.train()  # Set back to training mode after evaluation
+            # Evaluate test accuracy every 200 samples on all tasks
+            if sample_idx % 200 == 0 and sample_idx > 0:
+                for task_name, test_loader in test_loaders.items():
+                    test_accuracy = evaluate_model(model, test_loader, device)
+                    mlflow.log_metric(f"{task_name}_test_accuracy_batch", test_accuracy, step=total_step)
+                    print(f'Sample [{sample_idx}/{samples_per_epoch}] - {task_name} Test Accuracy: {test_accuracy:.2f}%')
+                model.train()
 
-        epoch_loss = running_loss / len(train_loader)
-        epoch_acc = 100 * correct / total
-
-        mlflow.log_metric(f"{current_task}_train_loss", epoch_loss, step=epoch)
-        mlflow.log_metric(f"{current_task}_train_accuracy", epoch_acc, step=epoch)
-
-        print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
+        # End of epoch statistics
+        print(f"\nEpoch [{epoch+1}/{num_epochs}] Summary:")
+        print(f"Sample counts per task: {sample_counts}")
+        
+        for task in tasks:
+            if sample_counts[task] > 0:
+                epoch_loss = running_loss[task] / sample_counts[task]
+                epoch_acc = 100 * correct[task] / total[task] if total[task] > 0 else 0
+                mlflow.log_metric(f"{task}_train_loss", epoch_loss, step=epoch)
+                mlflow.log_metric(f"{task}_train_accuracy", epoch_acc, step=epoch)
+                print(f'{task}: Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
         
         # End of epoch evaluation and model saving
-        epoch_test_acc = evaluate_model(model, test_loader, device)
-        mlflow.log_metric(f"{current_task}_epoch_test_accuracy", epoch_test_acc, step=epoch)
-        print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Test Accuracy: {epoch_test_acc:.2f}%')
+        print(f"\nEpoch [{epoch+1}/{num_epochs}] - Evaluating all tasks:")
+        for task_name, test_loader in test_loaders.items():
+            epoch_test_acc = evaluate_model(model, test_loader, device)
+            mlflow.log_metric(f"{task_name}_epoch_test_accuracy", epoch_test_acc, step=epoch)
+            print(f'{task_name} Test Accuracy: {epoch_test_acc:.2f}%')
+            
+            # Save best weights for each task if accuracy improved
+            if epoch_test_acc > best_accuracies[task_name]:
+                best_accuracies[task_name] = epoch_test_acc
+                best_model_path = f"{model_name}_best_{task_name}.pth"
+                torch.save(model.state_dict(), best_model_path)
+                mlflow.log_artifact(best_model_path)
+                print(f"New best accuracy for {task_name}: {epoch_test_acc:.2f}%. Saved model to {best_model_path}")
+        
         model.train()
         
         # Save latest weights
         latest_model_path = f"{model_name}_latest.pth"
         torch.save(model.state_dict(), latest_model_path)
         mlflow.log_artifact(latest_model_path)
-        
-        # Save best weights for the current task if accuracy improved
-        if epoch_test_acc > best_accuracies[current_task]:
-            best_accuracies[current_task] = epoch_test_acc
-            best_model_path = f"{model_name}_best_{current_task}.pth"
-            torch.save(model.state_dict(), best_model_path)
-            mlflow.log_artifact(best_model_path)
-            print(f"New best accuracy for {current_task}: {epoch_test_acc:.2f}%. Saved model to {best_model_path}")
 
 
 def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.device) -> float:
