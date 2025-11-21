@@ -73,7 +73,7 @@ class Perceiver(nn.Module):
         self.image_size = 32  # Unified image size for all tasks
         self.latents = nn.Parameter(torch.randn(latent_size, latent_channels))  # learnable latent array
         self.latent_pos = nn.Parameter(torch.randn(latent_size, latent_channels))  # positional embedding for latents
-        self.latent_transformer = LatentTransformer(latent_channels, depth=2)
+        self.latent_transformer = LatentTransformer(latent_channels, depth=2, num_heads=4)
         # Generate random Fourier feature matrix for 2D positional encoding
         # Shape: (2, num_fourier_features) for (x, y) coordinates
         self.register_buffer('fourier_matrix', torch.randn(2, num_fourier_features))
