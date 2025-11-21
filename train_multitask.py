@@ -392,7 +392,6 @@ def main() -> None:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    mlflow.set_tracking_uri("http://127.0.0.1:8080")
     mlflow.set_experiment("multitask-training")
 
     with mlflow.start_run():
