@@ -13,6 +13,7 @@ import torchvision.transforms as transforms
 import mlflow
 import mlflow.pytorch
 import math
+import random
 from typing import Dict, Tuple, List
 
 
@@ -73,7 +74,7 @@ class Perceiver(nn.Module):
         self.image_size = 32  # Unified image size for all tasks
         self.latents = nn.Parameter(torch.randn(latent_size, latent_channels))  # learnable latent array
         self.latent_pos = nn.Parameter(torch.randn(latent_size, latent_channels))  # positional embedding for latents
-        self.latent_transformer = LatentTransformer(latent_channels, depth=2, num_heads=4)
+        self.latent_transformer = LatentTransformer(latent_channels, depth=2)
         # Generate random Fourier feature matrix for 2D positional encoding
         # Shape: (2, num_fourier_features) for (x, y) coordinates
         self.register_buffer('fourier_matrix', torch.randn(2, num_fourier_features))
@@ -303,6 +304,7 @@ def train_model(model: nn.Module, train_loaders: Dict[str, DataLoader], test_loa
     
     tasks = ['cifar100', 'mnist', 'cifar10']
     total_step = 0
+    best_accuracies: Dict[str, float] = {task: 0.0 for task in tasks}
 
     for epoch in range(num_epochs):
         # Round-robin task selection
@@ -364,6 +366,25 @@ def train_model(model: nn.Module, train_loaders: Dict[str, DataLoader], test_loa
         mlflow.log_metric(f"{current_task}_train_accuracy", epoch_acc, step=epoch)
 
         print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
+        
+        # End of epoch evaluation and model saving
+        epoch_test_acc = evaluate_model(model, test_loader, device)
+        mlflow.log_metric(f"{current_task}_epoch_test_accuracy", epoch_test_acc, step=epoch)
+        print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Test Accuracy: {epoch_test_acc:.2f}%')
+        model.train()
+        
+        # Save latest weights
+        latest_model_path = f"{model_name}_latest.pth"
+        torch.save(model.state_dict(), latest_model_path)
+        mlflow.log_artifact(latest_model_path)
+        
+        # Save best weights for the current task if accuracy improved
+        if epoch_test_acc > best_accuracies[current_task]:
+            best_accuracies[current_task] = epoch_test_acc
+            best_model_path = f"{model_name}_best_{current_task}.pth"
+            torch.save(model.state_dict(), best_model_path)
+            mlflow.log_artifact(best_model_path)
+            print(f"New best accuracy for {current_task}: {epoch_test_acc:.2f}%. Saved model to {best_model_path}")
 
 
 def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.device) -> float:
