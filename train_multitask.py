@@ -1,22 +1,42 @@
 #!/usr/bin/env python3
 """
-Multitask neural network training script (CIFAR-100, MNIST, CIFAR-10) with MLflow logging.
+Multitask neural network training script (CIFAR-100, MNIST, CIFAR-10) with Weights & Biases logging.
 Uses Perceiver-style input: each pixel as token with RGB + Fourier positional encoding.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
-import mlflow
-import mlflow.pytorch
+import wandb
 import math
 from typing import Dict, Tuple, List
+import modal
 
 
 model_name = "model_multitask"
+
+
+# Modal configuration
+app = modal.App("multitask-perceiver")
+image = modal.Image.debian_slim().pip_install(
+    "torch",
+    "torchvision",
+    "wandb",
+).env({
+    "WANDB_PROJECT": "perceiver-multitask",
+    "WANDB_API_KEY": os.environ.get("WANDB_API_KEY")
+})
+
+
+def get_required_env_var(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
 
 
 class LatentSelfAttentionBlock(nn.Module):
@@ -292,7 +312,7 @@ def calculate_gradient_statistics(model: nn.Module) -> Dict[str, float]:
 
 def train_model(model: nn.Module, train_loaders: Dict[str, DataLoader], test_loaders: Dict[str, DataLoader], 
                 criterion: nn.Module, optimizer: optim.Optimizer, device: torch.device, num_epochs: int) -> None:
-    """Train the model on multiple tasks and log metrics to MLflow."""
+    """Train the model on multiple tasks and log metrics to Weights & Biases."""
     model.train()
     
     tasks = ['mnist', 'cifar10']
@@ -334,48 +354,52 @@ def train_model(model: nn.Module, train_loaders: Dict[str, DataLoader], test_loa
             total_step += 1
             
             if batch_idx % 100 == 0:
-                mlflow.log_metric(f"{current_task}_batch_train_loss", loss.item(), step=total_step)
-
+                metrics: Dict[str, float] = {f"{current_task}_batch_train_loss": loss.item()}
                 model_stats = calculate_model_statistics(model)
-                for stat_name, stat_value in model_stats.items():
-                    mlflow.log_metric(f"model_stats/{stat_name}", stat_value, step=total_step)
+                metrics.update({f"model_stats/{k}": v for k, v in model_stats.items()})
 
-                for stat_name, stat_value in grad_stats.items():
-                    mlflow.log_metric(f"gradients/{stat_name}", stat_value, step=total_step)
+                metrics.update({f"gradients/{k}": v for k, v in grad_stats.items()})
+                wandb.log(metrics, step=total_step)
 
                 print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}, Accuracy: {100 * correct / total:.2f}%')
 
             if batch_idx % 400 == 0:
                 test_accuracy = evaluate_model(model, test_loader, device)
-                mlflow.log_metric(f"{current_task}_test_accuracy_batch", test_accuracy, step=total_step)
+                wandb.log({f"{current_task}_test_accuracy_batch": test_accuracy}, step=total_step)
                 print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Batch [{batch_idx+1}/{len(train_loader)}], Test Accuracy: {test_accuracy:.2f}%')
                 model.train()  # Set back to training mode after evaluation
 
         epoch_loss = running_loss / len(train_loader)
         epoch_acc = 100 * correct / total
 
-        mlflow.log_metric(f"{current_task}_train_loss", epoch_loss, step=epoch)
-        mlflow.log_metric(f"{current_task}_train_accuracy", epoch_acc, step=epoch)
+        wandb.log(
+            {f"{current_task}_train_loss": epoch_loss, f"{current_task}_train_accuracy": epoch_acc, "epoch": float(epoch)},
+            step=total_step,
+        )
 
         print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
         
         # End of epoch evaluation and model saving
         epoch_test_acc = evaluate_model(model, test_loader, device)
-        mlflow.log_metric(f"{current_task}_epoch_test_accuracy", epoch_test_acc, step=epoch)
+        wandb.log({f"{current_task}_epoch_test_accuracy": epoch_test_acc}, step=total_step)
         print(f'Epoch [{epoch+1}/{num_epochs}] ({current_task}), Test Accuracy: {epoch_test_acc:.2f}%')
         model.train()
         
         # Save latest weights
         latest_model_path = f"{model_name}_latest.pth"
         torch.save(model.state_dict(), latest_model_path)
-        mlflow.log_artifact(latest_model_path)
+        latest_artifact = wandb.Artifact(f"{model_name}_latest", type="model")
+        latest_artifact.add_file(latest_model_path)
+        wandb.log_artifact(latest_artifact)
         
         # Save best weights for the current task if accuracy improved
         if epoch_test_acc > best_accuracies[current_task]:
             best_accuracies[current_task] = epoch_test_acc
             best_model_path = f"{model_name}_best_{current_task}.pth"
             torch.save(model.state_dict(), best_model_path)
-            mlflow.log_artifact(best_model_path)
+            best_artifact = wandb.Artifact(f"{model_name}_best_{current_task}", type="model")
+            best_artifact.add_file(best_model_path)
+            wandb.log_artifact(best_artifact)
             print(f"New best accuracy for {current_task}: {epoch_test_acc:.2f}%. Saved model to {best_model_path}")
 
 
@@ -397,6 +421,7 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.devi
     return accuracy
 
 
+@app.function(image=image, gpu="any", timeout=7200)
 def main() -> None:
     """Main training function for Multitask Learning."""
     batch_size: int = 64
@@ -405,15 +430,26 @@ def main() -> None:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    mlflow.set_experiment("multitask-training")
+    wandb_project = get_required_env_var("WANDB_PROJECT")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME")
+    wandb_run = wandb.init(
+        project=wandb_project,
+        entity=wandb_entity,
+        name=wandb_run_name,
+        config={
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "num_epochs": num_epochs,
+            "device": str(device),
+            "tasks": "mnist, cifar10",
+            "dataset": "multitask",
+        },
+    )
+    if wandb_run is None:
+        raise RuntimeError("wandb.init() returned None")
 
-    with mlflow.start_run():
-        mlflow.log_param("batch_size", batch_size)
-        mlflow.log_param("learning_rate", learning_rate)
-        mlflow.log_param("num_epochs", num_epochs)
-        mlflow.log_param("device", str(device))
-        mlflow.log_param("tasks", "mnist, cifar10")
-
+    try:
         train_loaders, test_loaders = create_data_loaders(batch_size)
 
         # Latent channels = 100 to accommodate largest task (CIFAR-100)
@@ -426,11 +462,16 @@ def main() -> None:
         criterion: nn.Module = nn.CrossEntropyLoss()
         optimizer: optim.Optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-        mlflow.log_param("architecture/optimizer", optimizer.__class__.__name__)
-        mlflow.log_param("architecture/criterion", criterion.__class__.__name__)
         arch_info = get_model_architecture_info(model)
-        for param_name, param_value in arch_info.items():
-            mlflow.log_param(f"architecture/{param_name}", param_value)
+        wandb.config.update(
+            {
+                "architecture": arch_info,
+                "architecture/optimizer": optimizer.__class__.__name__,
+                "architecture/criterion": criterion.__class__.__name__,
+                "architecture/total_parameters": float(total_params),
+            },
+            allow_val_change=True,
+        )
 
         print("Starting training...")
         train_model(model, train_loaders, test_loaders, criterion, optimizer, device, num_epochs)
@@ -438,13 +479,25 @@ def main() -> None:
         print("Final Evaluation...")
         for task_name, loader in test_loaders.items():
             acc = evaluate_model(model, loader, device)
-            mlflow.log_metric(f"{task_name}_final_test_accuracy", acc)
+            wandb.log({f"{task_name}_final_test_accuracy": acc})
             print(f'{task_name} Final Test Accuracy: {acc:.2f}%')
 
-        mlflow.pytorch.log_model(model, name=model_name)
+        model_path = f"{model_name}.pt"
+        torch.save(model.state_dict(), model_path)
+        model_artifact = wandb.Artifact(model_name, type="model")
+        model_artifact.add_file(model_path)
+        wandb_run.log_artifact(model_artifact)
 
-        print("Training completed and logged to MLflow!")
+        print("Training completed and logged to Weights & Biases!")
+    finally:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
     main()
+
+
+@app.local_entrypoint()
+def run() -> None:
+    """Entrypoint for 'modal run'."""
+    main.remote()

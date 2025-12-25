@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Minimal CIFAR-10 neural network training script with MLflow logging.
+Minimal CIFAR-10 neural network training script with Weights & Biases logging.
 Uses Perceiver-style input: each pixel as token with RGB + Fourier positional encoding.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
-import mlflow
-import mlflow.pytorch
-import math
+import wandb
 from typing import Dict, Tuple
 import modal
+
+from model import Perceiver
 
 
 # Modal configuration
@@ -22,196 +23,55 @@ app = modal.App("cifar10-perceiver")
 image = modal.Image.debian_slim().pip_install(
     "torch",
     "torchvision",
-    "mlflow",
-)
+    "wandb",
+).env({
+    "WANDB_PROJECT": "perceiver",
+    "WANDB_API_KEY": ""
+}).add_local_python_source("model")
 
 
 model_name = "model_cifar10"
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-
-class LatentSelfAttentionBlock(nn.Module):
-    """One block of latent Transformer: self-attention + MLP, with residuals & layer norm."""
-
-    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-
-        self.ln2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_ratio * dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_ratio * dim, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, N, D)
-        h = self.ln1(x)
-        attn_out, _ = self.attn(h, h, h)   # self-attention on latents
-        x = x + attn_out                   # residual connection
-
-        h = self.ln2(x)
-        mlp_out = self.mlp(h)
-        x = x + mlp_out                    # residual connection
-        return x
-
-
-class LatentTransformer(nn.Module):
-    """Stack of latent self-attention blocks."""
-
-    def __init__(self, dim: int, depth: int = 6, num_heads: int = 8, mlp_ratio: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            LatentSelfAttentionBlock(dim, num_heads, mlp_ratio, dropout)
-            for _ in range(depth)
-        ])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, N, D)
-        for blk in self.blocks:
-            x = blk(x)
-        return x
-
-class CrossAttentionBlock(nn.Module):
-    """Cross-attention block with layer norm, projections, and dropout."""
-
-    def __init__(self, dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.ln = nn.LayerNorm(dim)
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.out = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, latents: torch.Tensor, input_tokens: torch.Tensor) -> torch.Tensor:
-        # latents: (batch, N, D), input_tokens: (batch, M, D)
-        h = self.ln(latents)
-        q = self.q(h)
-        k = self.k(input_tokens)
-        v = self.v(input_tokens)
-        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(latents.size(-1))
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-        out = self.out(attn @ v)
-        return latents + out  # residual connection
-
-
-class Perceiver(nn.Module):
-    """Perceiver-style model with per-pixel tokens (RGB + positional encoding) for CIFAR-10."""
-
-    def __init__(self, num_fourier_features: int = 16, latent_size: int = 256, latent_channels: int = 64, num_cross_attn_layers: int = 8, dropout: float = 0.1) -> None:
-        super(Perceiver, self).__init__()
-        self.num_fourier_features = num_fourier_features
-        self.image_size = 32  # CIFAR-10 images are 32x32
-        self.latents = nn.Parameter(torch.randn(latent_size, latent_channels))  # learnable latent array
-        self.latent_pos = nn.Parameter(torch.randn(latent_size, latent_channels))  # positional embedding for latents
-        self.latent_transformer = LatentTransformer(latent_channels, depth=2, dropout=dropout)
-        # Generate random Fourier feature matrix for 2D positional encoding
-        # Shape: (2, num_fourier_features) for (x, y) coordinates
-        self.register_buffer('fourier_matrix', torch.randn(2, num_fourier_features))
-        
-        # Each token: RGB (3) + Fourier features (2 * num_fourier_features)
-        self.token_dim = 3 + 2 * num_fourier_features
-        self.num_tokens = self.image_size * self.image_size  # 1024 tokens
-        
-        # Project input tokens to latent dimension
-        self.input_projection = nn.Linear(self.token_dim, latent_channels)
-        
-        # Separate cross-attention blocks for each iteration
-        self.cross_attn_blocks = nn.ModuleList([
-            CrossAttentionBlock(latent_channels, dropout=dropout)
-            for _ in range(num_cross_attn_layers)
-        ])
-
-        # Classification head
-        self.classifier = nn.Linear(latent_channels, 10)
-
-    def create_positional_encoding(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Create Fourier positional encoding for 2D coordinates."""
-        # Create coordinate grid
-        y_coords, x_coords = torch.meshgrid(
-            torch.arange(self.image_size, device=device),
-            torch.arange(self.image_size, device=device),
-            indexing='ij'
-        )
-        
-        # Normalize coordinates to [0, 1]
-        x_coords = x_coords.float() / (self.image_size - 1)
-        y_coords = y_coords.float() / (self.image_size - 1)
-        
-        # Stack coordinates: (32, 32, 2)
-        coords = torch.stack([x_coords, y_coords], dim=-1)
-        
-        # Flatten to (1024, 2) and expand for batch
-        coords = coords.view(-1, 2).unsqueeze(0).expand(batch_size, -1, -1)
-        
-        # Apply Fourier features: (batch_size, 1024, 2) @ (2, num_fourier_features)
-        fourier_proj = torch.matmul(coords, self.fourier_matrix)
-        
-        # Create sine and cosine features
-        fourier_features = torch.cat([
-            torch.cos(2 * math.pi * fourier_proj),
-            torch.sin(2 * math.pi * fourier_proj)
-        ], dim=-1)  # (batch_size, 1024, 2 * num_fourier_features)
-        
-        return fourier_features
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size = x.size(0)
-        device = x.device
-
-        latents = self.latents + self.latent_pos  # shape (N, D)
-        latents = latents.unsqueeze(0).expand(batch_size, -1, -1)  # broadcast to batch
-        
-        # Reshape to tokens: (batch_size, 3, 32, 32) -> (batch_size, 1024, 3)
-        rgb_tokens = x.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 3)
-        
-        # Get positional encoding: (batch_size, 1024, 2 * num_fourier_features)
-        pos_encoding = self.create_positional_encoding(batch_size, device)
-        
-        # Concatenate RGB with positional encoding: (batch_size, 1024, 3 + 2*num_fourier_features)
-        input_tokens = torch.cat([rgb_tokens, pos_encoding], dim=-1)
-        
-        # Project input tokens to latent dimension
-        input_tokens = self.input_projection(input_tokens)  # (batch_size, 1024, latent_channels)
-        
-        for cross_attn in self.cross_attn_blocks:
-            latents = cross_attn(latents, input_tokens)  # (batch_size, N, D)
-            latents = self.latent_transformer(latents)  # (batch_size, N, D)
-
-        # Global average pooling over latents and classify
-        pooled = latents.mean(dim=1)  # (batch_size, latent_channels)
-        logits = self.classifier(pooled)  # (batch_size, 10)
-        
-        return logits
+def get_required_env_var(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
 
 
 def create_data_loaders(batch_size: int) -> Tuple[DataLoader, DataLoader]:
     """Create CIFAR-10 train and test data loaders."""
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        transforms.Normalize(
+            mean=[0.4914, 0.4822, 0.4465],
+            std=[0.2023, 0.1994, 0.2010]
+        )
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.4914, 0.4822, 0.4465],
+            std=[0.2023, 0.1994, 0.2010]
+        )
     ])
 
     train_dataset = torchvision.datasets.CIFAR10(
         root='./data',
         train=True,
         download=True,
-        transform=transform
+        transform=train_transform
     )
 
     test_dataset = torchvision.datasets.CIFAR10(
         root='./data',
         train=False,
         download=True,
-        transform=transform
+        transform=test_transform
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -321,8 +181,8 @@ def calculate_gradient_statistics(model: nn.Module) -> Dict[str, float]:
 
 
 def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoader, criterion: nn.Module,
-                optimizer: optim.Optimizer, device: torch.device, num_epochs: int) -> None:
-    """Train the model and log metrics to MLflow."""
+                optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.LRScheduler, device: torch.device, num_epochs: int) -> None:
+    """Train the model and log metrics to Weights & Biases."""
     model.train()
 
     batch_count = 0
@@ -350,31 +210,33 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
             correct += (predicted == target).sum().item()
             batch_count += 1
             if batch_idx % 100 == 0 and batch_idx > 0:
-                mlflow.log_metric("batch_train_loss", loss.item(), step=batch_count)
-
                 model_stats = calculate_model_statistics(model)
-                for stat_name, stat_value in model_stats.items():
-                    mlflow.log_metric("model_stats/batch_" + stat_name, stat_value, step=batch_count)
-
-                for stat_name, stat_value in grad_stats.items():
-                    mlflow.log_metric("gradients/batch_" + stat_name, stat_value, step=batch_count)
+                metrics: Dict[str, float] = {"batch_train_loss": loss.item()}
+                metrics.update({f"model_stats/batch_{k}": v for k, v in model_stats.items()})
+                metrics.update({f"gradients/batch_{k}": v for k, v in grad_stats.items()})
+                wandb.log(metrics, step=batch_count)
 
                 print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}, Accuracy: {100 * correct / total:.2f}%')
 
             # Evaluate test accuracy every 200 batches
             if batch_idx % 1000 == 0 and batch_idx > 0:
                 test_accuracy = evaluate_model(model, test_loader, device)
-                mlflow.log_metric("test_accuracy_batch", test_accuracy, step=batch_count)
+                wandb.log({"test_accuracy_batch": test_accuracy}, step=batch_count)
                 print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Test Accuracy: {test_accuracy:.2f}%')
                 model.train()  # Set back to training mode after evaluation
 
         epoch_loss = running_loss / len(train_loader)
         epoch_acc = 100 * correct / total
 
-        mlflow.log_metric("train_loss", epoch_loss, step=epoch)
-        mlflow.log_metric("train_accuracy", epoch_acc, step=epoch)
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
 
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
+        wandb.log(
+            {"train_loss": epoch_loss, "train_accuracy": epoch_acc, "epoch": float(epoch), "learning_rate": current_lr},
+            step=batch_count,
+        )
+
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%, LR: {current_lr:.6f}')
 
 
 def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.device) -> float:
@@ -396,61 +258,88 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.devi
 
 
 @app.function(image=image, gpu="any", timeout=7200)
-def main(mlflow_tracking_uri: str = None) -> None:
+def main() -> None:
     """Main training function for CIFAR-10."""
     batch_size: int = 32
     learning_rate: float = 0.001
-    num_epochs: int = 200
+    num_epochs: int = 50
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    
-    if mlflow_tracking_uri:
-        mlflow.set_tracking_uri(mlflow_tracking_uri)
-    
-    mlflow.set_experiment("cifar10-training")
 
-    with mlflow.start_run():
-        mlflow.log_param("batch_size", batch_size)
-        mlflow.log_param("learning_rate", learning_rate)
-        mlflow.log_param("num_epochs", num_epochs)
-        mlflow.log_param("device", str(device))
+    wandb_project = get_required_env_var("WANDB_PROJECT")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME")
+    wandb_run = wandb.init(
+        project=wandb_project,
+        entity=wandb_entity,
+        name=wandb_run_name,
+        config={
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "num_epochs": num_epochs,
+            "device": str(device),
+            "dataset": "cifar10",
+        },
+    )
 
-        train_loader, test_loader = create_data_loaders(batch_size)
+    train_loader, test_loader = create_data_loaders(batch_size)
 
-        model: nn.Module = Perceiver().to(device)
-        # Print and verify parameter count
-        total_params: int = sum(p.numel() for p in model.parameters())
-        print(f'Total parameters: {total_params}')
+    model: nn.Module = Perceiver(
+        num_classes=10,
+        num_fourier_features=8,
+        latent_size=256,
+        latent_channels=128,
+        num_cross_attn_layers=2,
+        latent_transformer_depth=6,
+        latent_transformer_num_heads=8,
+        latent_transformer_mlp_ratio=4,
+        dropout=0.1,
+        image_size=32,
+    ).to(device)
+    # Print and verify parameter count
+    total_params: int = sum(p.numel() for p in model.parameters())
+    print(f'Total parameters: {total_params}')
 
-        criterion: nn.Module = nn.CrossEntropyLoss()
-        optimizer: optim.Optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion: nn.Module = nn.CrossEntropyLoss()
+    optimizer: optim.Optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+    scheduler: optim.lr_scheduler.LRScheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
-        mlflow.log_param("architecture/optimizer", optimizer.__class__.__name__)
-        mlflow.log_param("architecture/criterion", criterion.__class__.__name__)
-        arch_info = get_model_architecture_info(model)
-        for param_name, param_value in arch_info.items():
-            mlflow.log_param(f"architecture/{param_name}", param_value)
+    arch_info = get_model_architecture_info(model)
+    wandb.config.update(
+        {
+            "architecture": arch_info,
+            "architecture/optimizer": optimizer.__class__.__name__,
+            "architecture/criterion": criterion.__class__.__name__,
+            "architecture/total_parameters": float(total_params),
+        },
+        allow_val_change=True,
+    )
 
-        print("Starting training...")
-        train_model(model, train_loader, test_loader, criterion, optimizer, device, num_epochs)
+    print("Starting training...")
+    train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, device, num_epochs)
 
-        print("Evaluating model...")
-        test_accuracy = evaluate_model(model, test_loader, device)
-        mlflow.log_metric("test_accuracy", test_accuracy)
-        print(f'Test Accuracy: {test_accuracy:.2f}%')
+    print("Evaluating model...")
+    test_accuracy = evaluate_model(model, test_loader, device)
+    wandb.log({"test_accuracy": test_accuracy})
+    print(f'Test Accuracy: {test_accuracy:.2f}%')
 
-        mlflow.pytorch.log_model(model, name=model_name)
+    model_path = f"{model_name}.pt"
+    torch.save(model.state_dict(), model_path)
+    model_artifact = wandb.Artifact(model_name, type="model")
+    model_artifact.add_file(model_path)
+    wandb_run.log_artifact(model_artifact)
 
-        print("Training completed and logged to MLflow!")
+    wandb_run.finish()
+
+    print("Training completed and logged to Weights & Biases!")
 
 
 @app.local_entrypoint()
-def run(mlflow_uri: str = ""):
+def run() -> None:
     """Entrypoint for 'modal run'."""
-    main.remote(mlflow_tracking_uri=mlflow_uri)
+    main.remote()
 
 
 if __name__ == "__main__":
     main()
-
