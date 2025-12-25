@@ -275,13 +275,12 @@ def main() -> None:
 
         model: nn.Module = Perceiver(
             num_classes=100,
-            num_fourier_features=64,
-            latent_size=256,
-            latent_channels=64,
-            num_cross_attn_layers=8,
-            latent_transformer_depth=2,
+            num_fourier_bands=64,
+            latent_size=512,
+            latent_channels=1024,
+            num_cross_attn_iterations=8,
+            latent_transformer_depth=6,
             latent_transformer_num_heads=8,
-            latent_transformer_mlp_ratio=4,
             dropout=0.1,
             image_size=32,
         ).to(device)

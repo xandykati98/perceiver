@@ -41,13 +41,12 @@ def get_required_env_var(name: str) -> str:
 
 class ModelConfig(BaseModel):
     """Configuration for Perceiver model architecture."""
-    num_fourier_features: int
+    num_fourier_bands: int
     latent_size: int
     latent_channels: int
-    num_cross_attn_layers: int
+    num_cross_attn_iterations: int
     latent_transformer_depth: int
     latent_transformer_num_heads: int
-    latent_transformer_mlp_ratio: int
     dropout: float
 
 
@@ -70,13 +69,12 @@ EXPERIMENTS: List[ExperimentConfig] = [
     ExperimentConfig(
         name="tiny",
         model=ModelConfig(
-            num_fourier_features=4,
+            num_fourier_bands=4,
             latent_size=64,
-            latent_channels=8,
-            num_cross_attn_layers=1,
+            latent_channels=32,
+            num_cross_attn_iterations=2,
             latent_transformer_depth=2,
             latent_transformer_num_heads=1,
-            latent_transformer_mlp_ratio=2,
             dropout=0.1,
         ),
         train=TrainConfig(
@@ -88,13 +86,12 @@ EXPERIMENTS: List[ExperimentConfig] = [
     ExperimentConfig(
         name="small",
         model=ModelConfig(
-            num_fourier_features=8,
+            num_fourier_bands=16,
             latent_size=128,
-            latent_channels=16,
-            num_cross_attn_layers=1,
+            latent_channels=64,
+            num_cross_attn_iterations=4,
             latent_transformer_depth=4,
-            latent_transformer_num_heads=1,
-            latent_transformer_mlp_ratio=4,
+            latent_transformer_num_heads=2,
             dropout=0.1,
         ),
         train=TrainConfig(
@@ -106,13 +103,12 @@ EXPERIMENTS: List[ExperimentConfig] = [
     ExperimentConfig(
         name="medium",
         model=ModelConfig(
-            num_fourier_features=8,
+            num_fourier_bands=32,
             latent_size=256,
-            latent_channels=32,
-            num_cross_attn_layers=2,
+            latent_channels=256,
+            num_cross_attn_iterations=6,
             latent_transformer_depth=6,
-            latent_transformer_num_heads=2,
-            latent_transformer_mlp_ratio=4,
+            latent_transformer_num_heads=4,
             dropout=0.1,
         ),
         train=TrainConfig(
@@ -124,13 +120,12 @@ EXPERIMENTS: List[ExperimentConfig] = [
     ExperimentConfig(
         name="large",
         model=ModelConfig(
-            num_fourier_features=16,
-            latent_size=256,
-            latent_channels=64,
-            num_cross_attn_layers=4,
+            num_fourier_bands=64,
+            latent_size=512,
+            latent_channels=512,
+            num_cross_attn_iterations=8,
             latent_transformer_depth=6,
-            latent_transformer_num_heads=4,
-            latent_transformer_mlp_ratio=4,
+            latent_transformer_num_heads=8,
             dropout=0.1,
         ),
         train=TrainConfig(
@@ -340,13 +335,12 @@ def run_experiment(config: ExperimentConfig, device: torch.device) -> float:
 
         model: nn.Module = Perceiver(
             num_classes=10,
-            num_fourier_features=config.model.num_fourier_features,
+            num_fourier_bands=config.model.num_fourier_bands,
             latent_size=config.model.latent_size,
             latent_channels=config.model.latent_channels,
-            num_cross_attn_layers=config.model.num_cross_attn_layers,
+            num_cross_attn_iterations=config.model.num_cross_attn_iterations,
             latent_transformer_depth=config.model.latent_transformer_depth,
             latent_transformer_num_heads=config.model.latent_transformer_num_heads,
-            latent_transformer_mlp_ratio=config.model.latent_transformer_mlp_ratio,
             dropout=config.model.dropout,
             image_size=32,
         ).to(device)

@@ -26,7 +26,7 @@ image = modal.Image.debian_slim().pip_install(
     "wandb",
 ).env({
     "WANDB_PROJECT": "perceiver",
-    "WANDB_API_KEY": ""
+    "WANDB_API_KEY": "5c0d2d6b1fcad21af4e0cc3894c119285c4ddae5"
 }).add_local_python_source("model")
 
 
@@ -287,13 +287,12 @@ def main() -> None:
 
     model: nn.Module = Perceiver(
         num_classes=10,
-        num_fourier_features=8,
+        num_fourier_bands=64,
         latent_size=256,
         latent_channels=128,
-        num_cross_attn_layers=2,
+        num_cross_attn_iterations=8,
         latent_transformer_depth=6,
         latent_transformer_num_heads=8,
-        latent_transformer_mlp_ratio=4,
         dropout=0.1,
         image_size=32,
     ).to(device)

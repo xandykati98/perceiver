@@ -1,11 +1,50 @@
 #!/usr/bin/env python3
 """
-Perceiver-style model with per-pixel tokens (RGB + Fourier positional encoding).
+Perceiver model following the original paper (arXiv:2103.03206).
+- Position coords normalized to [-1, 1]
+- Deterministic log-spaced Fourier frequency bands
+- Weight sharing: first cross-attn/latent-transformer unique, rest share weights
 """
 
 import math
 import torch
 import torch.nn as nn
+
+
+def create_fourier_features(coords: torch.Tensor, num_bands: int, max_resolution: int) -> torch.Tensor:
+    """Create deterministic Fourier positional encoding with log-spaced frequency bands.
+    
+    Args:
+        coords: (batch, num_tokens, num_dims) coordinates in [-1, 1]
+        num_bands: Number of frequency bands per dimension
+        max_resolution: Maximum resolution for frequency scaling
+    
+    Returns:
+        (batch, num_tokens, num_dims * num_bands * 2) Fourier features
+    """
+    # Log-spaced frequencies from 1 to max_resolution/2
+    # freq_bands shape: (num_bands,)
+    freq_bands = torch.linspace(
+        1.0,
+        max_resolution / 2.0,
+        num_bands,
+        device=coords.device,
+        dtype=coords.dtype,
+    )
+    
+    # coords: (batch, num_tokens, num_dims) -> (batch, num_tokens, num_dims, 1)
+    # freq_bands: (num_bands,) -> (1, 1, 1, num_bands)
+    coords = coords.unsqueeze(-1)
+    freq_bands = freq_bands.view(1, 1, 1, num_bands)
+    
+    # (batch, num_tokens, num_dims, num_bands)
+    angles = coords * freq_bands * math.pi
+    
+    # Concatenate sin and cos: (batch, num_tokens, num_dims * num_bands * 2)
+    fourier_features = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+    fourier_features = fourier_features.view(coords.size(0), coords.size(1), -1)
+    
+    return fourier_features
 
 
 class LatentSelfAttentionBlock(nn.Module):
@@ -85,52 +124,68 @@ class CrossAttentionBlock(nn.Module):
 
 
 class Perceiver(nn.Module):
-    """Perceiver-style model with per-pixel tokens (RGB + positional encoding)."""
+    """Perceiver model following the original paper architecture.
+    
+    Key design choices per paper:
+    - Position coords normalized to [-1, 1]
+    - Deterministic log-spaced Fourier frequency bands  
+    - Weight sharing: first cross-attn/latent-transformer unique, rest share weights
+    """
 
     def __init__(
         self,
         num_classes: int,
-        num_fourier_features: int,
+        num_fourier_bands: int,
         latent_size: int,
         latent_channels: int,
-        num_cross_attn_layers: int,
+        num_cross_attn_iterations: int,
         latent_transformer_depth: int,
         latent_transformer_num_heads: int,
-        latent_transformer_mlp_ratio: int,
         dropout: float,
         image_size: int,
     ) -> None:
         super(Perceiver, self).__init__()
-        self.num_fourier_features = num_fourier_features
+        self.num_fourier_bands = num_fourier_bands
         self.image_size = image_size
-        self.latents = nn.Parameter(torch.randn(latent_size, latent_channels))  # learnable latent array
-        self.latent_pos = nn.Parameter(torch.randn(latent_size, latent_channels))  # positional embedding for latents
-        self.latent_transformer = LatentTransformer(
+        self.num_cross_attn_iterations = num_cross_attn_iterations
+        
+        # Learnable latent array with positional embedding
+        self.latents = nn.Parameter(torch.randn(latent_size, latent_channels))
+        self.latent_pos = nn.Parameter(torch.randn(latent_size, latent_channels))
+        
+        # Each token: RGB (3) + Fourier features (2 dims * num_bands * 2 for sin/cos)
+        self.token_dim = 3 + 2 * num_fourier_bands * 2
+        self.num_tokens = self.image_size * self.image_size
+        
+        # First cross-attention and latent transformer (unique weights)
+        self.first_cross_attn = CrossAttentionBlock(
+            latent_dim=latent_channels, input_dim=self.token_dim, dropout=dropout
+        )
+        self.first_latent_transformer = LatentTransformer(
             dim=latent_channels,
             depth=latent_transformer_depth,
             num_heads=latent_transformer_num_heads,
-            mlp_ratio=latent_transformer_mlp_ratio,
+            mlp_ratio=1,  # No bottleneck per paper
             dropout=dropout,
         )
-        # Generate random Fourier feature matrix for 2D positional encoding
-        # Shape: (2, num_fourier_features) for (x, y) coordinates
-        self.register_buffer('fourier_matrix', torch.randn(2, num_fourier_features))
         
-        # Each token: RGB (3) + Fourier features (2 * num_fourier_features)
-        self.token_dim = 3 + 2 * num_fourier_features
-        self.num_tokens = self.image_size * self.image_size
-        
-        # Cross-attention blocks project directly from input dim to latent dim (per paper)
-        self.cross_attn_blocks = nn.ModuleList([
-            CrossAttentionBlock(latent_dim=latent_channels, input_dim=self.token_dim, dropout=dropout)
-            for _ in range(num_cross_attn_layers)
-        ])
+        # Shared cross-attention and latent transformer (for iterations 2+)
+        self.shared_cross_attn = CrossAttentionBlock(
+            latent_dim=latent_channels, input_dim=self.token_dim, dropout=dropout
+        ) if num_cross_attn_iterations > 1 else None
+        self.shared_latent_transformer = LatentTransformer(
+            dim=latent_channels,
+            depth=latent_transformer_depth,
+            num_heads=latent_transformer_num_heads,
+            mlp_ratio=1,  # No bottleneck per paper
+            dropout=dropout,
+        ) if num_cross_attn_iterations > 1 else None
 
         # Classification head
         self.classifier = nn.Linear(latent_channels, num_classes)
 
     def create_positional_encoding(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Create Fourier positional encoding for 2D coordinates."""
+        """Create Fourier positional encoding with coords in [-1, 1] per paper."""
         # Create coordinate grid
         y_coords, x_coords = torch.meshgrid(
             torch.arange(self.image_size, device=device),
@@ -138,24 +193,18 @@ class Perceiver(nn.Module):
             indexing='ij'
         )
         
-        # Normalize coordinates to [0, 1]
-        x_coords = x_coords.float() / (self.image_size - 1)
-        y_coords = y_coords.float() / (self.image_size - 1)
+        # Normalize coordinates to [-1, 1] per paper
+        x_norm = (x_coords.float() / (self.image_size - 1)) * 2.0 - 1.0
+        y_norm = (y_coords.float() / (self.image_size - 1)) * 2.0 - 1.0
         
         # Stack coordinates: (image_size, image_size, 2)
-        coords = torch.stack([x_coords, y_coords], dim=-1)
+        coords = torch.stack([x_norm, y_norm], dim=-1)
         
         # Flatten to (num_tokens, 2) and expand for batch
         coords = coords.view(-1, 2).unsqueeze(0).expand(batch_size, -1, -1)
         
-        # Apply Fourier features: (batch_size, num_tokens, 2) @ (2, num_fourier_features)
-        fourier_proj = torch.matmul(coords, self.fourier_matrix)
-        
-        # Create sine and cosine features
-        fourier_features = torch.cat([
-            torch.cos(2 * math.pi * fourier_proj),
-            torch.sin(2 * math.pi * fourier_proj)
-        ], dim=-1)  # (batch_size, num_tokens, 2 * num_fourier_features)
+        # Apply deterministic Fourier features
+        fourier_features = create_fourier_features(coords, self.num_fourier_bands, self.image_size)
         
         return fourier_features
 
@@ -169,15 +218,20 @@ class Perceiver(nn.Module):
         # Reshape to tokens: (batch_size, 3, H, W) -> (batch_size, num_tokens, 3)
         rgb_tokens = x.permute(0, 2, 3, 1).contiguous().view(batch_size, -1, 3)
         
-        # Get positional encoding: (batch_size, num_tokens, 2 * num_fourier_features)
+        # Get positional encoding: (batch_size, num_tokens, 2 * num_bands * 2)
         pos_encoding = self.create_positional_encoding(batch_size, device)
         
-        # Concatenate RGB with positional encoding: (batch_size, num_tokens, 3 + 2*num_fourier_features)
+        # Concatenate RGB with positional encoding
         input_tokens = torch.cat([rgb_tokens, pos_encoding], dim=-1)
         
-        for cross_attn in self.cross_attn_blocks:
-            latents = cross_attn(latents, input_tokens)  # (batch_size, N, D)
-            latents = self.latent_transformer(latents)  # (batch_size, N, D)
+        # First iteration (unique weights)
+        latents = self.first_cross_attn(latents, input_tokens)
+        latents = self.first_latent_transformer(latents)
+        
+        # Subsequent iterations (shared weights)
+        for _ in range(self.num_cross_attn_iterations - 1):
+            latents = self.shared_cross_attn(latents, input_tokens)
+            latents = self.shared_latent_transformer(latents)
 
         # Global average pooling over latents and classify
         pooled = latents.mean(dim=1)  # (batch_size, latent_channels)
