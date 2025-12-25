@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal CIFAR-100 neural network training script with MLflow logging.
+Minimal CIFAR-10 neural network training script with MLflow logging.
 Uses Perceiver-style input: each pixel as token with RGB + Fourier positional encoding.
 """
 
@@ -14,9 +14,19 @@ import mlflow
 import mlflow.pytorch
 import math
 from typing import Dict, Tuple
+import modal
 
 
-model_name = "model_cifar100"
+# Modal configuration
+app = modal.App("cifar10-perceiver")
+image = modal.Image.debian_slim().pip_install(
+    "torch",
+    "torchvision",
+    "mlflow",
+)
+
+
+model_name = "model_cifar10"
 
 import torch
 import torch.nn as nn
@@ -94,12 +104,12 @@ class CrossAttentionBlock(nn.Module):
 
 
 class Perceiver(nn.Module):
-    """Perceiver-style model with per-pixel tokens (RGB + positional encoding) for CIFAR-100."""
+    """Perceiver-style model with per-pixel tokens (RGB + positional encoding) for CIFAR-10."""
 
-    def __init__(self, num_fourier_features: int = 64, latent_size: int = 256, latent_channels: int = 64, num_cross_attn_layers: int = 8, dropout: float = 0.1) -> None:
+    def __init__(self, num_fourier_features: int = 16, latent_size: int = 256, latent_channels: int = 64, num_cross_attn_layers: int = 8, dropout: float = 0.1) -> None:
         super(Perceiver, self).__init__()
         self.num_fourier_features = num_fourier_features
-        self.image_size = 32  # CIFAR-100 images are 32x32
+        self.image_size = 32  # CIFAR-10 images are 32x32
         self.latents = nn.Parameter(torch.randn(latent_size, latent_channels))  # learnable latent array
         self.latent_pos = nn.Parameter(torch.randn(latent_size, latent_channels))  # positional embedding for latents
         self.latent_transformer = LatentTransformer(latent_channels, depth=2, dropout=dropout)
@@ -121,7 +131,7 @@ class Perceiver(nn.Module):
         ])
 
         # Classification head
-        self.classifier = nn.Linear(latent_channels, 100)
+        self.classifier = nn.Linear(latent_channels, 10)
 
     def create_positional_encoding(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Create Fourier positional encoding for 2D coordinates."""
@@ -178,26 +188,26 @@ class Perceiver(nn.Module):
 
         # Global average pooling over latents and classify
         pooled = latents.mean(dim=1)  # (batch_size, latent_channels)
-        logits = self.classifier(pooled)  # (batch_size, 100)
+        logits = self.classifier(pooled)  # (batch_size, 10)
         
         return logits
 
 
 def create_data_loaders(batch_size: int) -> Tuple[DataLoader, DataLoader]:
-    """Create CIFAR-100 train and test data loaders."""
+    """Create CIFAR-10 train and test data loaders."""
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
-    train_dataset = torchvision.datasets.CIFAR100(
+    train_dataset = torchvision.datasets.CIFAR10(
         root='./data',
         train=True,
         download=True,
         transform=transform
     )
 
-    test_dataset = torchvision.datasets.CIFAR100(
+    test_dataset = torchvision.datasets.CIFAR10(
         root='./data',
         train=False,
         download=True,
@@ -329,7 +339,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
             loss = criterion(output, target)
             loss.backward()
 
-            if batch_idx % 100 == 0:
+            if batch_idx % 100 == 0 and batch_idx > 0:
                 grad_stats = calculate_gradient_statistics(model)
 
             optimizer.step()
@@ -339,7 +349,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
             total += target.size(0)
             correct += (predicted == target).sum().item()
             batch_count += 1
-            if batch_idx % 100 == 0:
+            if batch_idx % 100 == 0 and batch_idx > 0:
                 mlflow.log_metric("batch_train_loss", loss.item(), step=batch_count)
 
                 model_stats = calculate_model_statistics(model)
@@ -352,7 +362,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
                 print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}, Accuracy: {100 * correct / total:.2f}%')
 
             # Evaluate test accuracy every 200 batches
-            if batch_idx % 200 == 0:
+            if batch_idx % 1000 == 0 and batch_idx > 0:
                 test_accuracy = evaluate_model(model, test_loader, device)
                 mlflow.log_metric("test_accuracy_batch", test_accuracy, step=batch_count)
                 print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Test Accuracy: {test_accuracy:.2f}%')
@@ -385,16 +395,20 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.devi
     return accuracy
 
 
-def main() -> None:
-    """Main training function for CIFAR-100."""
-    batch_size: int = 64
+@app.function(image=image, gpu="any", timeout=7200)
+def main(mlflow_tracking_uri: str = None) -> None:
+    """Main training function for CIFAR-10."""
+    batch_size: int = 32
     learning_rate: float = 0.001
     num_epochs: int = 200
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    mlflow.set_tracking_uri("http://127.0.0.1:8080")
-    mlflow.set_experiment("cifar100-training")
+    
+    if mlflow_tracking_uri:
+        mlflow.set_tracking_uri(mlflow_tracking_uri)
+    
+    mlflow.set_experiment("cifar10-training")
 
     with mlflow.start_run():
         mlflow.log_param("batch_size", batch_size)
@@ -431,7 +445,12 @@ def main() -> None:
         print("Training completed and logged to MLflow!")
 
 
+@app.local_entrypoint()
+def run(mlflow_uri: str = ""):
+    """Entrypoint for 'modal run'."""
+    main.remote(mlflow_tracking_uri=mlflow_uri)
+
+
 if __name__ == "__main__":
     main()
-
 
