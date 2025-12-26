@@ -16,18 +16,19 @@ from typing import Dict, Tuple
 import modal
 
 from model import Perceiver
+from lamb import Lamb
 
 
 # Modal configuration
 app = modal.App("cifar10-perceiver")
-image = modal.Image.debian_slim().pip_install(
+image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "torch",
     "torchvision",
     "wandb",
 ).env({
     "WANDB_PROJECT": "perceiver",
     "WANDB_API_KEY": "5c0d2d6b1fcad21af4e0cc3894c119285c4ddae5"
-}).add_local_python_source("model")
+}).add_local_python_source("model", "lamb")
 
 
 model_name = "model_cifar10"
@@ -195,7 +196,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
             data, target = data.to(device), target.to(device)
 
             optimizer.zero_grad()
-            output = model(data)
+            output = model(data, mask=None)
             loss = criterion(output, target)
             loss.backward()
 
@@ -248,7 +249,7 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.devi
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
-            output = model(data)
+            output = model(data, mask=None)
             _, predicted = torch.max(output, 1)
             total += target.size(0)
             correct += (predicted == target).sum().item()
@@ -287,21 +288,30 @@ def main() -> None:
 
     model: nn.Module = Perceiver(
         num_classes=10,
-        num_fourier_bands=64,
+        num_fourier_bands=32,
         latent_size=256,
         latent_channels=128,
-        num_cross_attn_iterations=8,
+        num_cross_attn_iterations=4,
         latent_transformer_depth=6,
-        latent_transformer_num_heads=8,
-        dropout=0.1,
+        latent_transformer_num_heads=2,
+        cross_heads=2,
+        dropout=0.05,
         image_size=32,
+        max_freq=32.0,
     ).to(device)
     # Print and verify parameter count
     total_params: int = sum(p.numel() for p in model.parameters())
     print(f'Total parameters: {total_params}')
 
     criterion: nn.Module = nn.CrossEntropyLoss()
-    optimizer: optim.Optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+    optimizer: optim.Optimizer = Lamb(
+        params=model.parameters(),
+        lr=learning_rate,
+        betas=(0.9, 0.999),
+        eps=1e-6,
+        weight_decay=0.0,
+        bias_correction=True,
+    )
     scheduler: optim.lr_scheduler.LRScheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
     arch_info = get_model_architecture_info(model)
@@ -341,4 +351,4 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main.local()

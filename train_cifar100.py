@@ -20,7 +20,7 @@ from model import Perceiver
 
 # Modal configuration
 app = modal.App("cifar100-perceiver")
-image = modal.Image.debian_slim().pip_install(
+image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "torch",
     "torchvision",
     "wandb",
@@ -182,7 +182,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
             data, target = data.to(device), target.to(device)
 
             optimizer.zero_grad()
-            output = model(data)
+            output = model(data, mask=None)
             loss = criterion(output, target)
             loss.backward()
 
@@ -233,7 +233,7 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.devi
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
-            output = model(data)
+            output = model(data, mask=None)
             _, predicted = torch.max(output, 1)
             total += target.size(0)
             correct += (predicted == target).sum().item()
@@ -281,8 +281,10 @@ def main() -> None:
             num_cross_attn_iterations=8,
             latent_transformer_depth=6,
             latent_transformer_num_heads=8,
+            cross_heads=1,
             dropout=0.1,
             image_size=32,
+            max_freq=32.0,
         ).to(device)
         # Print and verify parameter count
         total_params: int = sum(p.numel() for p in model.parameters())
