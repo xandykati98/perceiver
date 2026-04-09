@@ -5,6 +5,11 @@ Uses Perceiver-style input: each pixel as token with RGB + Fourier positional en
 """
 
 import os
+
+from project_env import load_project_env
+
+load_project_env()
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -27,7 +32,7 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "wandb",
 ).env({
     "WANDB_PROJECT": "perceiver",
-    "WANDB_API_KEY": "5c0d2d6b1fcad21af4e0cc3894c119285c4ddae5"
+    "WANDB_API_KEY": os.environ.get("WANDB_API_KEY")
 }).add_local_python_source("model", "lamb")
 
 

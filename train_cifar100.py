@@ -5,9 +5,15 @@ Uses Perceiver-style input: each pixel as token with RGB + Fourier positional en
 """
 
 import os
+
+from project_env import load_project_env
+
+load_project_env()
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
@@ -168,9 +174,12 @@ def calculate_gradient_statistics(model: nn.Module) -> Dict[str, float]:
 
 
 def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoader, criterion: nn.Module,
-                optimizer: optim.Optimizer, device: torch.device, num_epochs: int) -> None:
+                optimizer: optim.Optimizer, device: torch.device, num_epochs: int, use_amp: bool) -> None:
     """Train the model and log metrics to Weights & Biases."""
     model.train()
+
+    amp_enabled: bool = use_amp and device.type == "cuda"
+    scaler: GradScaler = GradScaler("cuda", enabled=amp_enabled)
 
     batch_count = 0
     for epoch in range(num_epochs):
@@ -181,22 +190,25 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
 
-            optimizer.zero_grad()
-            output = model(data, mask=None)
-            loss = criterion(output, target)
-            loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                output = model(data, mask=None)
+                loss = criterion(output, target)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
 
-            if batch_idx % 100 == 0:
+            if batch_idx % 1000 == 0 and batch_idx > 0:
                 grad_stats = calculate_gradient_statistics(model)
 
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += loss.item()
             _, predicted = torch.max(output.data, 1)
             total += target.size(0)
             correct += (predicted == target).sum().item()
             batch_count += 1
-            if batch_idx % 100 == 0:
+            if batch_idx % 1000 == 0 and batch_idx > 0:
                 metrics: Dict[str, float] = {"batch_train_loss": loss.item()}
                 model_stats = calculate_model_statistics(model)
                 metrics.update({f"model_stats/batch_{k}": v for k, v in model_stats.items()})
@@ -207,8 +219,8 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
                 print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}, Accuracy: {100 * correct / total:.2f}%')
 
             # Evaluate test accuracy every 200 batches
-            if batch_idx % 200 == 0:
-                test_accuracy = evaluate_model(model, test_loader, device)
+            if batch_idx % 5000 == 0 and batch_idx > 0:
+                test_accuracy = evaluate_model(model, test_loader, device, use_amp)
                 wandb.log({"test_accuracy_batch": test_accuracy}, step=batch_count)
                 print(f'Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Test Accuracy: {test_accuracy:.2f}%')
                 model.train()  # Set back to training mode after evaluation
@@ -224,16 +236,19 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%')
 
 
-def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.device) -> float:
+def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.device, use_amp: bool) -> float:
     """Evaluate the model and return accuracy."""
     model.eval()
     correct = 0
     total = 0
 
+    amp_enabled: bool = use_amp and device.type == "cuda"
+
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
-            output = model(data, mask=None)
+            with autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                output = model(data, mask=None)
             _, predicted = torch.max(output, 1)
             total += target.size(0)
             correct += (predicted == target).sum().item()
@@ -245,11 +260,12 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, device: torch.devi
 @app.function(image=image, gpu="any", timeout=7200)
 def main() -> None:
     """Main training function for CIFAR-100."""
-    batch_size: int = 64
+    batch_size: int = 4
     learning_rate: float = 0.001
     num_epochs: int = 200
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_amp: bool = device.type == "cuda"
     print(f'Using device: {device}')
 
     wandb_project = get_required_env_var("WANDB_PROJECT")
@@ -265,6 +281,7 @@ def main() -> None:
             "num_epochs": num_epochs,
             "device": str(device),
             "dataset": "cifar100",
+            "use_amp": use_amp,
         },
     )
     if wandb_run is None:
@@ -276,8 +293,8 @@ def main() -> None:
         model: nn.Module = Perceiver(
             num_classes=100,
             num_fourier_bands=64,
-            latent_size=512,
-            latent_channels=1024,
+            latent_size=128,
+            latent_channels=128,
             num_cross_attn_iterations=8,
             latent_transformer_depth=6,
             latent_transformer_num_heads=8,
@@ -305,10 +322,10 @@ def main() -> None:
         )
 
         print("Starting training...")
-        train_model(model, train_loader, test_loader, criterion, optimizer, device, num_epochs)
+        train_model(model, train_loader, test_loader, criterion, optimizer, device, num_epochs, use_amp)
 
         print("Evaluating model...")
-        test_accuracy = evaluate_model(model, test_loader, device)
+        test_accuracy = evaluate_model(model, test_loader, device, use_amp)
         wandb.log({"test_accuracy": test_accuracy})
         print(f'Test Accuracy: {test_accuracy:.2f}%')
 
@@ -330,4 +347,4 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main.local()

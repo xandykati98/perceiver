@@ -1,5 +1,10 @@
+/.venv
 /temp
 /__pycache__
 /data
 /mlruns
 .env
+outputs/
+tabular_encoder/
+perceiver.egg-info/
+wandb/

@@ -5,6 +5,11 @@ Uses Perceiver-style input: each pixel as token with RGB + Fourier positional en
 """
 
 import os
+
+from project_env import load_project_env
+
+load_project_env()
+
 import torch
 import torch.nn as nn
 import torch.optim as optim

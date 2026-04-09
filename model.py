@@ -213,7 +213,11 @@ class Perceiver(nn.Module):
         )
         self.first_self_attn_blocks = nn.ModuleList([
             nn.ModuleList([
-                PreNormSelfAttention(dim=latent_channels, heads=latent_transformer_num_heads, dropout=dropout),
+                PreNormSelfAttention(
+                    dim=latent_channels,
+                    heads=latent_transformer_num_heads,
+                    dropout=dropout,
+                ),
                 PreNormFeedForward(dim=latent_channels, mult=4, dropout=dropout),
             ])
             for _ in range(latent_transformer_depth)
@@ -225,7 +229,11 @@ class Perceiver(nn.Module):
         ) if num_cross_attn_iterations > 1 else None
         self.shared_self_attn_blocks = nn.ModuleList([
             nn.ModuleList([
-                PreNormSelfAttention(dim=latent_channels, heads=latent_transformer_num_heads, dropout=dropout),
+                PreNormSelfAttention(
+                    dim=latent_channels,
+                    heads=latent_transformer_num_heads,
+                    dropout=dropout,
+                ),
                 PreNormFeedForward(dim=latent_channels, mult=4, dropout=dropout),
             ])
             for _ in range(latent_transformer_depth)

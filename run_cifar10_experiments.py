@@ -5,6 +5,11 @@ Runs each configuration one after another and logs results to Weights & Biases.
 """
 
 import os
+
+from project_env import load_project_env
+
+load_project_env()
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
